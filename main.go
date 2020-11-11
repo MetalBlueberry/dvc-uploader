@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/md5"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -13,7 +15,10 @@ import (
 	"strings"
 
 	"gopkg.in/ini.v1"
+	"gopkg.in/src-d/go-billy.v4/memfs"
 	"gopkg.in/src-d/go-git.v4"
+	"gopkg.in/src-d/go-git.v4/plumbing"
+	"gopkg.in/src-d/go-git.v4/plumbing/object"
 	"gopkg.in/src-d/go-git.v4/storage/memory"
 	"gopkg.in/yaml.v2"
 )
@@ -22,9 +27,11 @@ func main() {
 	var (
 		repoURL       string
 		trackedFolder string
+		branch        string
 	)
 	flag.StringVar(&repoURL, "repo", "dvc-uploader-test", "url or path of the git repository")
 	flag.StringVar(&trackedFolder, "trackedFolder", "dataset.dvc", "Path to the file .dvc file that tracks the folder content")
+	flag.StringVar(&branch, "branch", "master", "git branch to add data")
 	flag.Parse()
 
 	files := flag.Args()
@@ -40,41 +47,71 @@ func main() {
 	// 	panic("you must provide a tracked folder with -trackedFolder")
 	// }
 
+	fileName := flag.Arg(0)
+
+	uploadFile, err := os.Open(fileName)
+	if err != nil {
+		panic(err)
+	}
+
+	hash := md5.New()
+	_, err = io.Copy(hash, uploadFile)
+	if err != nil {
+		panic(err)
+	}
+
+	fileMD5 := hex.EncodeToString(hash.Sum(nil))
+	log.Printf("File hash %s", fileMD5)
+
 	storage := memory.NewStorage()
-	repo, err := git.Clone(storage, nil, &git.CloneOptions{
-		URL: repoURL,
+	fs := memfs.New()
+	repo, err := git.Clone(storage, fs, &git.CloneOptions{
+		URL:           repoURL,
+		ReferenceName: plumbing.NewBranchReferenceName(branch),
+		SingleBranch:  true,
 	})
 	if err != nil {
 		panic(err)
 	}
+
+	wt, err := repo.Worktree()
+	if err != nil {
+		panic(err)
+	}
+
+	// err = wt.Checkout(&git.CheckoutOptions{Branch: plumbing.NewBranchReferenceName(branch)})
+	// if err != nil {
+	// 	panic(err)
+	// }
 
 	// repo, err := git.PlainOpen("./example-get-started")
 	// repo, err := git.PlainOpen("./dvc-uploader-test")
 	// if err != nil {
 	// 	panic(err)
 	// }
+	// rev, err := repo.ResolveRevision("HEAD")
+	// if err != nil {
+	// 	panic(err)
+	// }
 
-	rev, err := repo.ResolveRevision("HEAD")
+	// commit, err := repo.CommitObject(*rev)
+	// if err != nil {
+	// 	panic(err)
+	// }
+
+	config, err := wt.Filesystem.Open(".dvc/config")
+	// config, err := commit.File(".dvc/config")
 	if err != nil {
 		panic(err)
 	}
+	defer config.Close()
 
-	commit, err := repo.CommitObject(*rev)
-	if err != nil {
-		panic(err)
-	}
+	// creader, err := config.Reader()
+	// if err != nil {
+	// 	panic(err)
+	// }
 
-	config, err := commit.File(".dvc/config")
-	if err != nil {
-		panic(err)
-	}
-
-	creader, err := config.Reader()
-	if err != nil {
-		panic(err)
-	}
-
-	gconf, err := NewGlobalConfig(creader)
+	gconf, err := NewGlobalConfig(config)
 	if err != nil {
 		panic(err)
 	}
@@ -86,17 +123,30 @@ func main() {
 
 	log.Printf("Using remote %s", defaultRemote)
 
-	trackedFolderFile, err := commit.File(trackedFolder)
-	if err != nil {
-		panic(fmt.Errorf("Cannot find tracked folder file %s, %w", trackedFolder, err))
-	}
-
-	trackedFolderReader, err := trackedFolderFile.Reader()
+	_, err = uploadFile.Seek(0, 0)
 	if err != nil {
 		panic(err)
 	}
 
-	decoder := yaml.NewDecoder(trackedFolderReader)
+	err = defaultRemote.Upload(context.Background(), fileMD5, uploadFile)
+	if err != nil {
+		panic(err)
+	}
+
+	log.Print("File uploaded to remote")
+
+	trackedFolderFile, err := wt.Filesystem.Open(trackedFolder)
+	// trackedFolderFile, err := commit.File(trackedFolder)
+	if err != nil {
+		panic(fmt.Errorf("Cannot find tracked folder file %s, %w", trackedFolder, err))
+	}
+
+	// trackedFolderReader, err := trackedFolderFile.Reader()
+	// if err != nil {
+	// 	panic(err)
+	// }
+
+	decoder := yaml.NewDecoder(trackedFolderFile)
 
 	dvcFile := &DVCFile{}
 	err = decoder.Decode(dvcFile)
@@ -119,13 +169,52 @@ func main() {
 	}
 
 	dirContent = append(dirContent, DVCDirListItem{
-		MD5:     "test",
-		RelPath: "test",
+		MD5:     fileMD5,
+		RelPath: fileName,
 	})
 
-	jEncoder := json.NewEncoder(os.Stdout)
-	jEncoder.Encode(dirContent)
+	newTrackedFolder, err := wt.Filesystem.Create(trackedFolder)
+	if err != nil {
+		panic(err)
+	}
 
+	sum := md5.New()
+	jEncoder := json.NewEncoder(io.MultiWriter(newTrackedFolder, sum))
+	jEncoder.Encode(dirContent)
+	newTrackedFolder.Close()
+
+	dirFile, err := wt.Filesystem.Open(trackedFolder)
+	dirMD5 := hex.EncodeToString(sum.Sum(nil))
+	err = defaultRemote.Upload(context.Background(), dirMD5, dirFile)
+	if err != nil {
+		panic(err)
+	}
+	dirFile.Close()
+
+	log.Printf("Uploaded new dir %s", dirMD5)
+
+	_, err = wt.Add(trackedFolder)
+	if err != nil {
+		panic(err)
+	}
+
+	finalCommit, err := wt.Commit("Update file", &git.CommitOptions{
+		Author: &object.Signature{
+			Name:  "dvc uploader",
+			Email: "invalid@nope.com",
+		},
+	})
+	if err != nil {
+		panic(err)
+	}
+	log.Print("Committed changes ", finalCommit.String())
+
+	err = repo.Push(&git.PushOptions{})
+	if err != nil {
+		panic(err)
+	}
+
+	log.Print("pushed to git")
 }
 
 type GlobalConfig struct {
@@ -162,12 +251,13 @@ type LocalRemote struct {
 }
 
 func (remote *LocalRemote) Upload(ctx context.Context, path string, data io.Reader) error {
-	err := os.MkdirAll(filepath.Dir(filepath.Join(remote.URL, path[:2], path[2:])), 0700)
+	remotePath := filepath.Join(remote.URL, path[:2], path[2:])
+	err := os.MkdirAll(filepath.Dir(remotePath), 0700)
 	if err != nil {
 		return fmt.Errorf("Cannot create directory, %w", err)
 	}
 
-	file, err := os.Create(filepath.Join(remote.URL, path))
+	file, err := os.Create(remotePath)
 	if err != nil {
 		return fmt.Errorf("Cannot create file, %w", err)
 	}
