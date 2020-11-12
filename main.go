@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5"
 	"encoding/hex"
@@ -24,30 +25,38 @@ import (
 )
 
 func main() {
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, `POC to upload files to a dvc tracked folder
+This implementation just upload the first file provided as a parameter
+
+Flags: 
+`)
+		flag.PrintDefaults()
+	}
 	var (
 		repoURL       string
 		trackedFolder string
 		branch        string
 	)
 	flag.StringVar(&repoURL, "repo", "dvc-uploader-test", "url or path of the git repository")
-	flag.StringVar(&trackedFolder, "trackedFolder", "dataset.dvc", "Path to the file .dvc file that tracks the folder content")
+	flag.StringVar(&trackedFolder, "folder", "dataset.dvc", "Path to the file .dvc file that tracks the folder content")
 	flag.StringVar(&branch, "branch", "master", "git branch to add data")
 	flag.Parse()
 
 	files := flag.Args()
-	log.Printf("Files to upload %s", files)
-
-	// if repoURL == "" {
-	// 	panic("you must provide a repository URL with -repo")
-	// }
-	// if fileToUpload == "" {
-	// 	panic("you must provide a file with -file flag")
-	// }
-	// if trackedFolder == "" {
-	// 	panic("you must provide a tracked folder with -trackedFolder")
-	// }
+	log.Printf("File to upload %s", files)
 
 	fileName := flag.Arg(0)
+
+	if repoURL == "" {
+		panic("you must provide a repository URL with -repo")
+	}
+	if trackedFolder == "" {
+		panic("you must provide a tracked folder with -trackedFolder")
+	}
+	if fileName == "" {
+		panic("you must provide a file as the first parameter")
+	}
 
 	uploadFile, err := os.Open(fileName)
 	if err != nil {
@@ -173,25 +182,28 @@ func main() {
 		RelPath: fileName,
 	})
 
+	buff := &bytes.Buffer{}
+	sum := md5.New()
+	jEncoder := json.NewEncoder(io.MultiWriter(sum, buff))
+	jEncoder.Encode(dirContent)
+
+	dirMD5 := hex.EncodeToString(sum.Sum(nil)) + ".dir"
+	err = defaultRemote.Upload(context.Background(), dirMD5, buff)
+	if err != nil {
+		panic(err)
+	}
+
+	log.Printf("Uploaded new dir %s", dirMD5)
+
+	dvcFile.Outs[0].MD5 = dirMD5
+
 	newTrackedFolder, err := wt.Filesystem.Create(trackedFolder)
 	if err != nil {
 		panic(err)
 	}
-
-	sum := md5.New()
-	jEncoder := json.NewEncoder(io.MultiWriter(newTrackedFolder, sum))
-	jEncoder.Encode(dirContent)
+	yEncoder := yaml.NewEncoder(newTrackedFolder)
+	yEncoder.Encode(dvcFile)
 	newTrackedFolder.Close()
-
-	dirFile, err := wt.Filesystem.Open(trackedFolder)
-	dirMD5 := hex.EncodeToString(sum.Sum(nil))
-	err = defaultRemote.Upload(context.Background(), dirMD5, dirFile)
-	if err != nil {
-		panic(err)
-	}
-	dirFile.Close()
-
-	log.Printf("Uploaded new dir %s", dirMD5)
 
 	_, err = wt.Add(trackedFolder)
 	if err != nil {
@@ -368,11 +380,11 @@ type DVCFile struct {
 }
 
 type DVCOut struct {
-	MD5  string
-	Path string
+	MD5  string `json:"md5,omitempty"`
+	Path string `json:"path,omitempty"`
 }
 
 type DVCDirListItem struct {
-	MD5     string
-	RelPath string
+	MD5     string `json:"md5,omitempty"`
+	RelPath string `json:"relpath,omitempty"`
 }
