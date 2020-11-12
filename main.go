@@ -212,8 +212,7 @@ Flags:
 
 	finalCommit, err := wt.Commit("Update file", &git.CommitOptions{
 		Author: &object.Signature{
-			Name:  "dvc uploader",
-			Email: "invalid@nope.com",
+			Name: "dvc-uploader",
 		},
 	})
 	if err != nil {
