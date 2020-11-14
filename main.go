@@ -88,37 +88,11 @@ Flags:
 		panic(err)
 	}
 
-	// err = wt.Checkout(&git.CheckoutOptions{Branch: plumbing.NewBranchReferenceName(branch)})
-	// if err != nil {
-	// 	panic(err)
-	// }
-
-	// repo, err := git.PlainOpen("./example-get-started")
-	// repo, err := git.PlainOpen("./dvc-uploader-test")
-	// if err != nil {
-	// 	panic(err)
-	// }
-	// rev, err := repo.ResolveRevision("HEAD")
-	// if err != nil {
-	// 	panic(err)
-	// }
-
-	// commit, err := repo.CommitObject(*rev)
-	// if err != nil {
-	// 	panic(err)
-	// }
-
 	config, err := wt.Filesystem.Open(".dvc/config")
-	// config, err := commit.File(".dvc/config")
 	if err != nil {
 		panic(err)
 	}
 	defer config.Close()
-
-	// creader, err := config.Reader()
-	// if err != nil {
-	// 	panic(err)
-	// }
 
 	gconf, err := NewGlobalConfig(config)
 	if err != nil {
@@ -145,15 +119,9 @@ Flags:
 	log.Print("File uploaded to remote")
 
 	trackedFolderFile, err := wt.Filesystem.Open(trackedFolder)
-	// trackedFolderFile, err := commit.File(trackedFolder)
 	if err != nil {
 		panic(fmt.Errorf("Cannot find tracked folder file %s, %w", trackedFolder, err))
 	}
-
-	// trackedFolderReader, err := trackedFolderFile.Reader()
-	// if err != nil {
-	// 	panic(err)
-	// }
 
 	decoder := yaml.NewDecoder(trackedFolderFile)
 
@@ -171,13 +139,13 @@ Flags:
 	}
 
 	jDecoder := json.NewDecoder(content)
-	dirContent := []DVCDirListItem{}
+	dirContent := DVCDirFilelist{}
 	err = jDecoder.Decode(&dirContent)
 	if err != nil {
 		panic(err)
 	}
 
-	dirContent = append(dirContent, DVCDirListItem{
+	dirContent.Add(DVCDirListItem{
 		MD5:     fileMD5,
 		RelPath: fileName,
 	})
@@ -209,7 +177,13 @@ Flags:
 	if err != nil {
 		panic(err)
 	}
-
+	status, err := wt.Status()
+	if err != nil {
+		panic(err)
+	}
+	if status.IsClean() {
+		panic("No modifications detected, is the file already uploaded?")
+	}
 	finalCommit, err := wt.Commit("Update file", &git.CommitOptions{
 		Author: &object.Signature{
 			Name: "dvc-uploader",
@@ -386,4 +360,18 @@ type DVCOut struct {
 type DVCDirListItem struct {
 	MD5     string `json:"md5,omitempty"`
 	RelPath string `json:"relpath,omitempty"`
+}
+
+type DVCDirFilelist []DVCDirListItem
+
+func (dir *DVCDirFilelist) Add(item DVCDirListItem) {
+	for i := range *dir {
+		if (*dir)[i].RelPath == item.RelPath {
+			log.Print("Updaing existing item")
+			(*dir)[i].MD5 = item.MD5
+			return
+		}
+	}
+	log.Print("append new item")
+	(*dir) = append((*dir), item)
 }
